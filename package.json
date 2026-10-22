@@ -1,0 +1,45 @@
+{
+  "name": "monad-keeper",
+  "version": "1.0.0",
+  "description": "Keeper that compounds Monad staking rewards via an EIP-7702 delegate, without the owner key",
+  "private": "true",
+  "main": "src/index.ts",
+  "scripts": {
+    "keygen": "bun src/index.ts keygen",
+    "status": "bun src/index.ts status",
+    "top": "bun src/index.ts top",
+    "delegate-address": "forge build --quiet && bun src/index.ts delegate-address",
+    "authorize": "forge build --quiet && bun src/index.ts authorize",
+    "setup": "forge build --quiet && bun src/index.ts setup",
+    "revoke": "bun src/index.ts revoke",
+    "compound": "bun src/index.ts run --once",
+    "start": "bun src/index.ts run",
+    "build": "forge build",
+    "build:linux-x64": "bun build src/index.ts --compile --no-compile-autoload-dotenv --no-compile-autoload-bunfig --external '@ledgerhq/*' --target=bun-linux-x64 --outfile dist/monad-keeper-linux-x64",
+    "build:linux-arm64": "bun build src/index.ts --compile --no-compile-autoload-dotenv --no-compile-autoload-bunfig --external '@ledgerhq/*' --target=bun-linux-arm64 --outfile dist/monad-keeper-linux-arm64",
+    "test": "forge test",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@ledgerhq/hw-app-eth": "^7.9.0",
+    "@ledgerhq/hw-transport-node-hid-noevents": "^6.36.0",
+    "commander": "^15.0.0",
+    "ethers": "^6.17.0"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.2",
+    "@types/node": "^26.6.4",
+    "typescript": "^7.0.2"
+  },
+  "engines": {
+    "bun": ">=1.2"
+  },
+  "trustedDependencies": [
+    "node-hid"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/coinblitz-pro/monad-keeper.git"
+  }
+}

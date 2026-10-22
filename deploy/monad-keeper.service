@@ -1,0 +1,46 @@
+[Unit]
+Description=Monad keeper: compounds staking rewards through an EIP-7702 delegate
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/monad-keeper run
+# public.env: RPC_URL, OWNER_ADDRESS (world-readable, for `monad-keeper top`); env: the key
+EnvironmentFile=-/etc/monad-keeper/public.env
+EnvironmentFile=/etc/monad-keeper/env
+Restart=always
+RestartSec=30
+
+# Stay off the node's execution, consensus and RPC cores. Core 0 is the usual housekeeping core
+# (ledger-tail, IRQs); adjust to your layout with a drop-in if it differs
+CPUAffinity=0
+AllowedCPUs=0
+Nice=10
+CPUWeight=20
+
+# Throwaway unprivileged user, no access to the node's files or keys
+DynamicUser=yes
+ProtectHome=yes
+ProtectSystem=strict
+PrivateTmp=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectProc=invisible
+ProcSubset=pid
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

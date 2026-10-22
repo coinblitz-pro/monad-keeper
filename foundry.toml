@@ -1,0 +1,13 @@
+[profile.default]
+src = "contracts"
+test = "test"
+out = "out"
+libs = ["lib"]
+solc_version = "0.8.30"
+evm_version = "prague"
+optimizer = true
+optimizer_runs = 10000
+# No metadata hash in the bytecode, so the CREATE2 address depends on the code alone, not on
+# comments or source paths
+bytecode_hash = "none"
+cbor_metadata = false
