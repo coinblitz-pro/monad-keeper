@@ -21,10 +21,45 @@ Staking changes are snapshotted at boundary blocks every 50,000 blocks (~4 hours
 before the boundary activates in the next epoch, and one after it waits an extra epoch.
 Compounding more often than once per epoch gains nothing.
 
-The keeper therefore compounds once per epoch, `LEAD_BLOCKS` (300) blocks before the boundary.
+The keeper therefore checks once per epoch, `LEAD_BLOCKS` (300) blocks before the boundary.
 On chain, `getEpoch()` enters the delay period right after blocks numbered `≡ 49,999 mod 50,000`.
 Before sending, the keeper checks `getEpoch()`. If the epoch is already in the delay period, it
 skips this window and waits for the next one.
+
+## Interval
+
+Each compound costs gas, and rewards wait unstaked until the next one. Compounding every `n`
+epochs costs per epoch
+
+```
+cost / n + y · R · (n − 1) / 2
+```
+
+where `R` is what the owner accrues per epoch and `y` is what one more staked MON earns it per
+epoch. The minimum is at `n ≈ √(2 · cost / (y · R))`. With `COMPOUND_EVERY=auto` (the default)
+the keeper measures all three at each window:
+
+| | Source |
+|---|---|
+| `R` | Unclaimed rewards plus liquid balance above `OWNER_BALANCE_MON`, divided by the epochs since the last compound. Covers own rewards, the commission from other delegators when the owner is the validator's auth address, and priority fees when it is the beneficiary |
+| `y` | Growth of the validator's `accRewardPerToken` over the last 8 epochs. When the owner is the auth address the commission on its own stake comes back to it, so the rate before commission |
+| cost | `eth_estimateGas` of the compound plus the 100k margin, at the current gas price |
+
+The last compound (or claim) is the last change of the owner's stake or drop of its rewards,
+found by reading `getDelegator` at past blocks, so the keeper keeps no state and a restart changes
+nothing. This needs an RPC that serves `eth_call` on past blocks; a Monad node keeps several
+hundred thousand blocks (about 10 epochs). When the last compound is older than that, the keeper
+measures how fast rewards grow over the history it has and estimates the time since the compound
+as accrued / `R`. Without any history it compounds every epoch.
+
+Rough numbers: a validator with 1.3M MON of its own stake and 15% commission on ~50M of
+delegations accrues ~500 MON per epoch, `y` ≈ 0.006% per epoch, a compound costs ~0.07 MON, so
+`n` = 2. Compounding every epoch instead loses ~0.02 MON per epoch, about 45 MON a year. A plain
+delegator of 10,000 MON accrues ~0.5 MON per epoch and pays ~0.045 MON per compound, so `n` ≈ 60,
+about ten days; compounding every epoch would cost it ~9% of its rewards.
+
+`COMPOUND_EVERY=1` compounds every epoch without reading history, any other number every that
+many epochs.
 
 ## Gas refund
 
@@ -35,12 +70,12 @@ the keeper's balance is already final, and the delegate tops it up to exactly `K
 | Limit | Value |
 |---|---|
 | Per call | 0.2 MON, about 3× the cost of a compound at the minimum base fee |
-| Frequency | once per 40,000 blocks, so once per epoch |
+| Frequency | at most once per 40,000 blocks, so at most once per compound |
 | Owner reserve | skipped if the owner would drop below 11 MON: the chain's 10 MON floor plus gas for its own transactions |
 
 Top-ups come out of the owner's liquid balance, not its rewards: at the 100 gwei base fee a
-compound costs ~0.04 MON, ~0.25 MON a day. If the owner is also the node's beneficiary, priority
-fees cover that many times over. Otherwise, once the owner nears the 10 MON reserve, top-ups
+compound costs ~0.07 MON, ~0.4 MON a day when compounding every epoch. If the owner is also the
+node's beneficiary, priority fees cover that many times over. Otherwise, once the owner nears the 10 MON reserve, top-ups
 stop and the keeper slowly spends its own balance.
 
 ## Staking the liquid balance

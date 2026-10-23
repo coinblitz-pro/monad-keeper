@@ -22,8 +22,9 @@ sequenceDiagram
   receive a capped gas refund. It can't move funds anywhere else.
 - **Fees get staked too.** Liquid MON above `OWNER_BALANCE_MON` (e.g. priority fees, when the
   owner is the node's beneficiary) is delegated in the same call, always to the same validator.
-- **Optimal timing.** One compound per epoch, a few hundred blocks before the boundary block, so
-  rewards start earning in the very next epoch.
+- **Optimal timing.** A few hundred blocks before the boundary block, so rewards start earning
+  in the very next epoch. How many epochs apart is picked from the measured rewards, stake yield
+  and gas cost, so a validator owner compounds every couple of epochs and a small delegator less often.
 - **Self-funding.** The owner refunds each compound's gas exactly, so the keeper balance stays put.
 - **Revocable.** `revoke` removes the delegation without the keeper key and works with the stock
   Ledger app.
@@ -56,13 +57,13 @@ To run the keeper on a server, see [docs/server.md](docs/server.md).
 | `bun run setup [--ledger]` | Claim rewards, then `authorize`. The first compound stakes them back |
 | `bun run revoke [--ledger]` | Remove the delegation, without the keeper key |
 | `bun run compound` | Compound right now |
-| `bun run start` | Keeper loop: compound once per epoch |
+| `bun run start` | Keeper loop: compound every `COMPOUND_EVERY` epochs |
 | `bun run build:linux-x64` | Standalone server binary (also `build:linux-arm64`) |
 | `bun run test` | Contract tests |
 
 ## Docs
 
-- [How it works](docs/how-it-works.md): delegation, timing, gas refund, threat model
+- [How it works](docs/how-it-works.md): delegation, timing, interval, gas refund, threat model
 - [Configuration](docs/configuration.md): environment variables
 - [Running on a server](docs/server.md): standalone binary and a sandboxed systemd service
 - [Mainnet with Ledger](docs/ledger.md): signing the authorization when the owner is on a Ledger

@@ -49,7 +49,7 @@ program
 
 program
   .command('run')
-  .description('Compound once per epoch, LEAD_BLOCKS before the boundary block')
+  .description('Compound every COMPOUND_EVERY epochs (auto by default), LEAD_BLOCKS before the boundary block')
   .option('--once', 'Compound right now and exit')
   .action(runCommand)
 

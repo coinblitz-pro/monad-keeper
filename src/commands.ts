@@ -28,6 +28,7 @@ import {
   STAKING_CONTRACT,
   TOP_UP_INTERVAL,
 } from './config.js'
+import { compoundEvery, planCompound } from './plan.js'
 import { connectLedger, connectSecret, type OwnerSigner } from './signers.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
@@ -329,7 +330,8 @@ export async function setupCommand(options: { ledger?: boolean }) {
 /** Block the compound landed in; `sent` without a block when it couldn't be confirmed */
 type CompoundResult = { sent: false } | { sent: true; block: number | null }
 
-async function compoundOnce(provider: ethers.JsonRpcProvider, keeper: ethers.Wallet): Promise<CompoundResult> {
+/** With `window`, only compounds if COMPOUND_EVERY says this window is due */
+async function compoundOnce(provider: ethers.JsonRpcProvider, keeper: ethers.Wallet, window?: number): Promise<CompoundResult> {
   const owner = getOwner()
 
   // Whatever the owner delegated to, only call it if it is a CompoundDelegate bound to this keeper
@@ -350,6 +352,17 @@ async function compoundOnce(provider: ethers.JsonRpcProvider, keeper: ethers.Wal
   if (rewards < MIN_REWARDS) {
     log(`Skip: rewards ${formatMon(rewards)} < ${formatMon(MIN_REWARDS)}`)
     return { sent: false }
+  }
+  if (window !== undefined) {
+    const plan = await planCompound(provider, {
+      owner, keeper: keeper.address, validatorId, ownerKeeps: await account.ownerBalance(),
+      head: await provider.getBlockNumber(), window, period: BOUNDARY_PERIOD,
+    })
+    if (!plan.due) {
+      log(`Skip: ${plan.note}, next compound at block ${plan.next}`)
+      return { sent: false }
+    }
+    log(`Plan: ${plan.note}`)
   }
 
   const [ balance, ownerKeeps, estimate, fee ] = await Promise.all([
@@ -397,9 +410,9 @@ const RETRY_MS = 5_000
 const MAX_ATTEMPTS = 3
 
 /**
- * Compounds once per epoch, LEAD_BLOCKS before the boundary block. Compounding more often
- * gains nothing: new stake only activates at the next snapshot, and anything compounded
- * after the boundary waits an extra epoch
+ * Checks once per epoch, LEAD_BLOCKS before the boundary block, and compounds every COMPOUND_EVERY
+ * epochs. Compounding more often than once per epoch gains nothing: new stake only activates at
+ * the next snapshot, and anything compounded after the boundary waits an extra epoch
  */
 async function runEpochs(provider: ethers.JsonRpcProvider, keeper: ethers.Wallet) {
   let blockTimeMs = await getBlockTimeMs(provider)
@@ -407,7 +420,8 @@ async function runEpochs(provider: ethers.JsonRpcProvider, keeper: ethers.Wallet
   let current = -1
   let attempts = 0
   let lastSentAt = 0
-  log(`Block time ${blockTimeMs.toFixed(0)} ms, compound ${LEAD_BLOCKS} blocks before each boundary (period ${BOUNDARY_PERIOD})`)
+  const every = compoundEvery()
+  log(`Block time ${blockTimeMs.toFixed(0)} ms, compound ${LEAD_BLOCKS} blocks before a boundary (period ${BOUNDARY_PERIOD}), ${every === 'auto' ? 'interval picked automatically' : `every ${every} epochs`}`)
 
   while (true) {
     let boundary = -1
@@ -422,7 +436,7 @@ async function runEpochs(provider: ethers.JsonRpcProvider, keeper: ethers.Wallet
 
       if (head < windowStart || done === boundary) {
         const waitBlocks = done === boundary ? boundary + 1 - head : windowStart - head
-        if (waitBlocks > 1000) log(`Next compound at block ${windowStart} (boundary ${boundary}), ~${Math.round(waitBlocks * blockTimeMs / 60_000)} min`)
+        if (waitBlocks > 1000) log(`Next window at block ${windowStart} (boundary ${boundary}), ~${Math.round(waitBlocks * blockTimeMs / 60_000)} min`)
         await sleep(Math.min(waitBlocks * blockTimeMs, MAX_SLEEP_MS))
         continue
       }
@@ -441,7 +455,7 @@ async function runEpochs(provider: ethers.JsonRpcProvider, keeper: ethers.Wallet
         continue
       }
 
-      const result = await compoundOnce(provider, keeper)
+      const result = await compoundOnce(provider, keeper, windowStart)
       if (result.sent) lastSentAt = Date.now()
       if (result.sent && result.block !== null && result.block >= boundary) {
         log(`Warning: included at ${result.block}, after boundary ${boundary}; increase LEAD_BLOCKS`)

@@ -40,6 +40,7 @@ sudoedit /etc/monad-keeper/public.env /etc/monad-keeper/env
 ```sh
 RPC_URL=http://127.0.0.1:8080
 OWNER_ADDRESS=0x...
+# COMPOUND_EVERY=auto
 ```
 
 `env`, root only:
@@ -60,9 +61,11 @@ journalctl -u monad-keeper -f
 ```
 
 ```
-Validator ID 126
-Block time 302 ms, compound 300 blocks before each boundary (period 50000)
-Next compound at block 73299699 (boundary 73299999), ~202 min
+Keeper 0x..., owner 0x...
+Block time 303 ms, compound 300 blocks before a boundary (period 50000), interval picked automatically
+Next window at block 115849699 (boundary 115849999), ~106 min
+...
+Skip: 470 MON accrued in 1 epoch (~477 MON/epoch), stake earns 0.00597%/epoch, compound costs 0.0718 MON → every 2 epochs, next compound at block 115899699
 ```
 
 To watch it live:

@@ -13,9 +13,9 @@ export interface DelegatorInfo {
   pendingStake: bigint
 }
 
-export async function getDelegator(provider: ethers.Provider, validatorId: number, delegator: string): Promise<DelegatorInfo> {
+export async function getDelegator(provider: ethers.Provider, validatorId: number, delegator: string, blockTag?: number): Promise<DelegatorInfo> {
   const data = GET_DELEGATOR + abiCoder.encode([ 'uint64', 'address' ], [ validatorId, delegator ]).slice(2)
-  const result = await provider.call({ to: STAKING_CONTRACT, data })
+  const result = await provider.call({ to: STAKING_CONTRACT, data, blockTag })
   // stake, accRewardPerToken, unclaimedRewards, deltaStake, nextDeltaStake, deltaEpoch, nextDeltaEpoch
   const decoded = abiCoder.decode([ 'uint256', 'uint256', 'uint256', 'uint256', 'uint256', 'uint64', 'uint64' ], result)
   return { stake: decoded[0], rewards: decoded[2], pendingStake: decoded[3] + decoded[4] }
@@ -37,10 +37,20 @@ async function getDelegations(provider: ethers.Provider, delegator: string): Pro
   }
 }
 
-async function getAuthAddress(provider: ethers.Provider, validatorId: number): Promise<string> {
+export interface ValidatorInfo {
+  authAddress: string
+  /** Delegators' reward per staked token since genesis, after commission, scaled by 1e36 */
+  accRewardPerToken: bigint
+  /** Share of rewards the auth address takes from every delegator, scaled by 1e18 */
+  commission: bigint
+}
+
+export async function getValidator(provider: ethers.Provider, validatorId: number, blockTag?: number): Promise<ValidatorInfo> {
   const data = GET_VALIDATOR + abiCoder.encode([ 'uint64' ], [ validatorId ]).slice(2)
-  const [ authAddress ] = abiCoder.decode([ 'address' ], await provider.call({ to: STAKING_CONTRACT, data }))
-  return authAddress
+  // authAddress, flags, stake, accRewardPerToken, commission, ...
+  const [ authAddress, , , accRewardPerToken, commission ] = abiCoder.decode(
+    [ 'address', 'uint64', 'uint256', 'uint256', 'uint256' ], await provider.call({ to: STAKING_CONTRACT, data, blockTag }))
+  return { authAddress, accRewardPerToken, commission }
 }
 
 /**
@@ -53,7 +63,7 @@ export async function resolveValidatorId(provider: ethers.Provider, owner: strin
   const ids = await getDelegations(provider, owner)
   if (ids.length === 1) return ids[0]
   for (const id of ids) {
-    if (await getAuthAddress(provider, id) === owner) return id
+    if ((await getValidator(provider, id)).authAddress === owner) return id
   }
   throw new Error(ids.length === 0
     ? `${owner} has no delegations, set VALIDATOR_ID`

@@ -12,16 +12,19 @@ import {
   resolveValidatorId,
 } from './chain.js'
 import { DELEGATE_ABI, env, getOwner, getProvider } from './config.js'
+import { compoundEvery, type Plan, planCompound } from './plan.js'
 
 // Read-only dashboard: chain state plus the service's journal. Needs no keys, only RPC_URL and
 // OWNER_ADDRESS, so on the server it can run as any user that can read them
 
 // public.env is world-readable, env holds the key and is root-only; older installs keep everything in env
 const SERVER_ENV_FILES = [ '/etc/monad-keeper/public.env', '/etc/monad-keeper/env' ]
-const PUBLIC_SETTINGS = [ 'RPC_URL', 'OWNER_ADDRESS', 'BOUNDARY_PERIOD', 'LEAD_BLOCKS' ]
+const PUBLIC_SETTINGS = [ 'RPC_URL', 'OWNER_ADDRESS', 'BOUNDARY_PERIOD', 'LEAD_BLOCKS', 'COMPOUND_EVERY' ]
 const SERVICE = 'monad-keeper'
 const REFRESH_MS = 3_000
 const BLOCK_TIME_REFRESH_MS = 5 * 60_000
+// The plan reads a few epochs of state history, so it is refreshed rarely
+const PLAN_REFRESH_MS = 5 * 60_000
 
 const c = {
   bold: (s: string) => `\x1b[1m${s}\x1b[0m`,
@@ -169,6 +172,9 @@ function bar(fraction: number, width: number): string {
 interface View {
   snapshot: Snapshot | null
   error: string | null
+  plan: Plan | null
+  planAt: number
+  planError: string | null
   blockTimeMs: number
   chainId: bigint
   owner: string
@@ -211,8 +217,11 @@ function render(view: View): string[] {
   const progress = ((head + 1) % period) / period
 
   lines.push(`${label('Block')}${blocks(head)}   ${c.dim('epoch')} ${s.epoch}${s.inDelayPeriod ? c.yellow('  (delay period)') : ''}   ${c.dim(`${blockTimeMs.toFixed(0)} ms/block`)}`)
-  if (head < windowStart) {
-    lines.push(`${label('Next')}compound at ${blocks(windowStart)} ${c.dim(`(boundary ${blocks(boundary)})`)}  in ${c.bold(duration((windowStart - head) * blockTimeMs))}`)
+  // A plan made for an earlier window is stale until the next refresh
+  const plan = view.plan?.window === windowStart ? view.plan : null
+  const next = plan && !plan.due ? plan.next : windowStart
+  if (head < next) {
+    lines.push(`${label('Next')}compound at ${blocks(next)} ${c.dim(`(boundary ${blocks(next + lead)})`)}  in ${c.bold(duration((next - head) * blockTimeMs))}`)
   } else {
     lines.push(`${label('Next')}${c.green('window open')}, boundary ${blocks(boundary)} in ${blocks(boundary - head)} blocks`)
   }
@@ -243,6 +252,10 @@ function render(view: View): string[] {
   if (d?.ownerKeeps != null && d.keeperTarget != null) {
     lines.push(`${label('Policy')}${c.dim(`owner keeps ${formatMon(d.ownerKeeps)}, the rest is staked; keeper refilled to ${formatMon(d.keeperTarget)}`)}`)
   }
+  const every = compoundEvery()
+  const interval = plan?.every ? `every ${plan.every} epoch${plan.every === 1 ? '' : 's'}${every === 'auto' ? ' (auto)' : ''}` : every === 'auto' ? 'auto' : `every ${every} epochs`
+  lines.push(`${label('Interval')}${interval}`)
+  if (every !== 1) lines.push(`${label('')}${plan ? c.dim(plan.note) : view.planError ? c.red(view.planError) : c.dim('estimating...')}`)
   if (view.error) lines.push(c.red(`RPC error: ${view.error} (showing data from ${duration(Date.now() - s.at)} ago)`))
 
   lines.push('')
@@ -276,6 +289,7 @@ function pinToServiceCpus() {
 export async function topCommand() {
   pinToServiceCpus()
   loadServerSettings()
+  compoundEvery() // fails on a bad COMPOUND_EVERY before the screen is taken over
   const provider = getProvider()
   const owner = getOwner()
   const period = parseInt(process.env.BOUNDARY_PERIOD || '50000', 10)
@@ -286,7 +300,7 @@ export async function topCommand() {
   let validatorId: number | null = null
   const fallbackValidator = async () => validatorId ??= await resolveValidatorId(provider, owner)
 
-  const view: View = { snapshot: null, error: null, blockTimeMs: 400, chainId, owner, rpc, period, lead }
+  const view: View = { snapshot: null, error: null, plan: null, planAt: 0, planError: null, blockTimeMs: 400, chainId, owner, rpc, period, lead }
   const draw = () => process.stdout.write('\x1b[H' + render(view).join('\x1b[K\n') + '\x1b[K\x1b[J')
 
   let refreshing = false
@@ -296,12 +310,28 @@ export async function topCommand() {
     try {
       view.snapshot = await readSnapshot(provider, owner, fallbackValidator)
       view.error = null
+      await refreshPlan(view.snapshot)
     } catch (e: any) {
       view.error = e.shortMessage ?? e.message
     } finally {
       refreshing = false
     }
     draw()
+  }
+  const refreshPlan = async (s: Snapshot) => {
+    const window = nextBoundary(s.head, period) - lead
+    const d = s.delegate
+    if (!d || d.ownerKeeps === null) return
+    if (view.plan?.window === window && Date.now() - view.planAt < PLAN_REFRESH_MS) return
+    view.planAt = Date.now()
+    try {
+      view.plan = await planCompound(provider, {
+        owner, keeper: d.keeper, validatorId: s.validatorId, ownerKeeps: d.ownerKeeps, head: s.head, window, period,
+      })
+      view.planError = null
+    } catch (e: any) {
+      view.planError = e.shortMessage ?? e.message
+    }
   }
   const refreshBlockTime = async () => {
     view.blockTimeMs = await getBlockTimeMs(provider).catch(() => view.blockTimeMs)
