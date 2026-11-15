@@ -2,9 +2,26 @@
 
 Auto-compound Monad staking rewards without putting the owner key on a server.
 
-The owner account (e.g. a validator's auth address on a Ledger) signs a single
-[EIP-7702](https://eips.ethereum.org/EIPS/eip-7702) authorization. From then on a separate hot
-key — the keeper — can trigger `compound()` for that account, and nothing else.
+![monad-keeper top on the server](assets/top.svg)
+
+- **Owner key stays offline.** The owner (e.g. a validator's auth address on a Ledger) signs a
+  single [EIP-7702](https://eips.ethereum.org/EIPS/eip-7702) authorization. The server holds only
+  a hot keeper key and the owner's address.
+- **Narrow permissions.** The keeper can compound rewards into the owner's own delegation and
+  receive a capped gas refund. It can't move funds anywhere else.
+- **Fees get staked too.** Liquid MON above `OWNER_BALANCE_MON` (e.g. priority fees, when the
+  owner is the node's beneficiary) is delegated in the same call, always to the same validator.
+- **Optimal timing.** A few hundred blocks before the boundary block, so rewards start earning
+  in the very next epoch. How many epochs apart is picked from the measured rewards, stake yield
+  and gas cost, so a validator owner compounds every couple of epochs and a small delegator less often.
+- **Self-funding.** The owner refunds each compound's gas exactly, so the keeper balance stays put.
+- **Revocable.** `revoke` removes the delegation without the keeper key and works with the stock
+  Ledger app.
+
+## How it works
+
+The authorization points the owner account at `CompoundDelegate`. The keeper calls `compound()` on
+the owner's address, and the delegate code does the rest as the owner:
 
 ```mermaid
 sequenceDiagram
@@ -17,17 +34,7 @@ sequenceDiagram
     O->>S: delegate(validatorId) liquid MON above 20
 ```
 
-- **Owner key stays offline.** The server holds only the keeper key and the owner's address.
-- **Narrow permissions.** The keeper can compound rewards into the owner's own delegation and
-  receive a capped gas refund. It can't move funds anywhere else.
-- **Fees get staked too.** Liquid MON above `OWNER_BALANCE_MON` (e.g. priority fees, when the
-  owner is the node's beneficiary) is delegated in the same call, always to the same validator.
-- **Optimal timing.** A few hundred blocks before the boundary block, so rewards start earning
-  in the very next epoch. How many epochs apart is picked from the measured rewards, stake yield
-  and gas cost, so a validator owner compounds every couple of epochs and a small delegator less often.
-- **Self-funding.** The owner refunds each compound's gas exactly, so the keeper balance stays put.
-- **Revocable.** `revoke` removes the delegation without the keeper key and works with the stock
-  Ledger app.
+Details, including the threat model, are in [docs/how-it-works.md](docs/how-it-works.md).
 
 ## Quick start
 
