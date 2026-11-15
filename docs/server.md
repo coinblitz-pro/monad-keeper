@@ -74,6 +74,10 @@ To watch it live:
 sudo monad-keeper top
 ```
 
+It shows panels for the epoch, the next compound (with what the auto interval was picked from),
+the owner and the keeper, a status line with anything that needs attention, and the service log
+without the "Next window" heartbeat.
+
 `top` moves itself onto the same cores as the service and only reads the chain and the
 service's journal. It takes `RPC_URL` and `OWNER_ADDRESS` from `public.env`, so it needs no root;
 the log needs root or the `systemd-journal` group.

@@ -3,7 +3,6 @@ import { spawnSync } from 'child_process'
 import { ethers } from 'ethers'
 import {
   type DelegatorInfo,
-  formatMon,
   getBlockTimeMs,
   getDelegationTarget,
   getDelegator,
@@ -11,7 +10,7 @@ import {
   nextBoundary,
   resolveValidatorId,
 } from './chain.js'
-import { DELEGATE_ABI, env, getOwner, getProvider } from './config.js'
+import { DELEGATE_ABI, env, getOwner, getProvider, OWNER_MIN_BALANCE } from './config.js'
 import { compoundEvery, type Plan, planCompound } from './plan.js'
 
 // Read-only dashboard: chain state plus the service's journal. Needs no keys, only RPC_URL and
@@ -25,6 +24,8 @@ const REFRESH_MS = 3_000
 const BLOCK_TIME_REFRESH_MS = 5 * 60_000
 // The plan reads a few epochs of state history, so it is refreshed rarely
 const PLAN_REFRESH_MS = 5 * 60_000
+// Log lines read to fill the screen once the heartbeat is dropped: a few days of it
+const JOURNAL_SCAN = 1_000
 
 const c = {
   bold: (s: string) => `\x1b[1m${s}\x1b[0m`,
@@ -58,7 +59,8 @@ interface Snapshot {
 }
 
 interface Service {
-  state: string
+  active: string
+  sub: string
   since: Date | null
 }
 
@@ -116,20 +118,39 @@ function readService(): Service | null {
   const props = Object.fromEntries(result.stdout.trim().split('\n').map(line => line.split(/=(.*)/s).slice(0, 2)))
   if (props.ActiveState === undefined) return null
   const since = props.ActiveEnterTimestamp ? new Date(props.ActiveEnterTimestamp.replace(/^\w+ /, '').replace(/ \w+$/, '')) : null
-  return { state: `${props.ActiveState}${props.SubState && props.SubState !== props.ActiveState ? ` (${props.SubState})` : ''}`, since }
+  return { active: props.ActiveState, sub: props.SubState ?? '', since }
 }
 
-/** Last service log lines as [time, message]; a string explains why there are none */
-function readJournal(lines: number): [ string, string ][] | string {
-  const result = spawnSync('journalctl', [ '-u', SERVICE, '-n', String(lines), '-o', 'short-iso', '--no-pager', '-q' ], { encoding: 'utf-8' })
-  if (result.error) return 'journalctl not available here'
-  if (result.status !== 0) return `No access to the journal of ${SERVICE} (run as root or a member of systemd-journal)`
-  return result.stdout.split('\n').filter(Boolean).map(line => {
-    const match = line.match(/^(\S+) \S+ [^:]+: (?:\[[^\]]+\] )?(.*)$/)
-    if (!match) return [ '', line ]
+let journal: { at: number; entries: [ string, string ][] | string } | null = null
+
+/** systemd's own lines about the unit: starts, stops and failures, without the rest of its chatter */
+function systemdMessage(message: string): string | null {
+  if (message.startsWith('Started ')) return 'Service started'
+  if (message.startsWith('Stopped ')) return 'Service stopped'
+  if (/FAILURE|Failed with result/.test(message)) return `Error: ${message.replace(`${SERVICE}.service: `, '')}`
+  return null
+}
+
+/**
+ * Recent service log lines as [time, message], without the keeper's "Next window" heartbeat that
+ * would push the compounds off the screen; a string explains why there are none
+ */
+function readJournal(): [ string, string ][] | string {
+  if (journal && Date.now() - journal.at < REFRESH_MS) return journal.entries
+  const result = spawnSync('journalctl', [ '-u', SERVICE, '-n', String(JOURNAL_SCAN), '-o', 'short-iso', '--no-pager', '-q' ], { encoding: 'utf-8' })
+  let entries: [ string, string ][] | string
+  if (result.error) entries = 'journalctl not available here'
+  else if (result.status !== 0) entries = `No access to the journal of ${SERVICE} (run as root or a member of systemd-journal)`
+  else entries = result.stdout.split('\n').filter(Boolean).flatMap((line): [ string, string ][] => {
+    const match = line.match(/^(\S+) \S+ ([^:\[]+)(?:\[\d+\])?: (?:\[[^\]]+\] )?(.*)$/)
+    if (!match) return [ [ '', line ] ]
+    const message = match[2] === 'systemd' ? systemdMessage(match[3]) : match[3]
+    if (message === null || message.startsWith('Next window')) return []
     const time = new Date(match[1])
-    return [ isNaN(time.getTime()) ? match[1] : `${pad(time.getMonth() + 1)}-${pad(time.getDate())} ${clock(time)}`, match[2] ]
+    return [ [ isNaN(time.getTime()) ? match[1] : `${pad(time.getMonth() + 1)}-${pad(time.getDate())} ${clock(time)}`, message ] ]
   })
+  journal = { at: Date.now(), entries }
+  return entries
 }
 
 const pad = (n: number) => String(n).padStart(2, '0')
@@ -164,9 +185,76 @@ function fit(line: string, width: number): string {
   return out
 }
 
+const visLen = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, '').length
+const epochs = (n: number) => `${n} epoch${n === 1 ? '' : 's'}`
+const mon = (wei: bigint) => `${Number(ethers.formatEther(wei)).toLocaleString('en-US', { maximumFractionDigits: 4 })} ${c.dim('MON')}`
+
 function bar(fraction: number, width: number): string {
   const filled = Math.round(Math.min(1, Math.max(0, fraction)) * width)
   return c.cyan('█'.repeat(filled)) + c.dim('░'.repeat(width - filled))
+}
+
+type Row = [ label: string, value: string ]
+
+/** A group of values in a rounded box with its title in the top edge */
+interface Panel {
+  title: string
+  rows: Row[]
+}
+
+// Space between a label and its value
+const GAP = 2
+// Widest each panel has been, so a value gaining a digit does not shift the panels to its right on
+// every frame; forgotten when the terminal width changes
+const widest = { cols: 0, inner: new Map<string, number>() }
+
+const labelWidth = (p: Panel) => Math.max(0, ...p.rows.map(([ label ]) => label.length))
+
+function box(p: Panel, height: number, inner: number): string[] {
+  const labelW = labelWidth(p)
+  const lines = [ c.dim('╭─ ') + c.cyan(p.title) + c.dim(` ${'─'.repeat(inner - p.title.length - 1)}╮`) ]
+  for (let i = 0; i < height; i++) {
+    const row = p.rows[i]
+    const content = row
+      ? c.dim(row[0].padEnd(labelW)) + ' '.repeat(GAP) + row[1] + ' '.repeat(inner - labelW - GAP - visLen(row[1]))
+      : ' '.repeat(inner)
+    lines.push(c.dim('│ ') + content + c.dim(' │'))
+  }
+  lines.push(c.dim(`╰${'─'.repeat(inner + 2)}╯`))
+  return lines
+}
+
+/** Panels side by side, wrapping onto another band when the terminal is narrow */
+function layout(panels: Panel[], cols: number): string[] {
+  if (widest.cols !== cols) {
+    widest.cols = cols
+    widest.inner.clear()
+  }
+  const inner = panels.map(p => {
+    const width = Math.max(labelWidth(p) + GAP + Math.max(0, ...p.rows.map(([ , value ]) => visLen(value))), p.title.length + 2, widest.inner.get(p.title) ?? 0)
+    widest.inner.set(p.title, width)
+    return width
+  })
+  const lines: string[] = []
+  for (let start = 0; start < panels.length;) {
+    let end = start + 1
+    let width = inner[start] + 4
+    while (end < panels.length && width + 1 + inner[end] + 4 <= cols) width += 1 + inner[end++] + 4
+    const band = panels.slice(start, end)
+    const height = Math.max(...band.map(p => p.rows.length))
+    const boxes = band.map((p, i) => box(p, height, inner[start + i]))
+    for (let i = 0; i < height + 2; i++) lines.push(boxes.map(b => b[i]).join(' '))
+    start = end
+  }
+  return lines
+}
+
+function logIcon(message: string): string {
+  if (message.startsWith('Error')) return c.red('✗')
+  if (message.startsWith('Warning')) return c.yellow('▲')
+  if (message.startsWith('Confirmed')) return c.green('✓')
+  if (message.startsWith('Compound ')) return c.cyan('↑')
+  return c.dim('·')
 }
 
 interface View {
@@ -183,100 +271,125 @@ interface View {
   lead: number
 }
 
-function render(view: View): string[] {
-  const { snapshot: s, period, lead, blockTimeMs } = view
-  const width = process.stdout.columns || 80
-  const height = process.stdout.rows || 30
-  const label = (text: string) => c.dim(text.padEnd(12))
-  const lines: string[] = []
-
-  const now = new Date()
-  const title = `${c.bold('monad-keeper')}  ${c.dim(`chain ${view.chainId} · ${view.rpc}`)}`
-  lines.push(`${title}${' '.repeat(Math.max(1, width - 14 - `chain ${view.chainId} · ${view.rpc}`.length - 8))}${clock(now)}`)
-  lines.push(c.dim('─'.repeat(width)))
-
-  const service = readService()
-  if (!service) {
-    lines.push(`${label('Service')}${c.dim('systemd not available here')}`)
-  } else {
-    const color = service.state.startsWith('active') ? c.green : service.state.startsWith('activating') ? c.yellow : c.red
-    const since = service.since && !isNaN(service.since.getTime()) ? c.dim(`  since ${service.since.toLocaleString('en-GB')} (${duration(now.getTime() - service.since.getTime())})`) : ''
-    lines.push(`${label('Service')}${color(service.state)}${since}`)
-  }
-
-  if (!s) {
-    lines.push('', view.error ? c.red(view.error) : c.dim('Loading...'))
-    return lines.map(line => fit(line, width))
-  }
-
+function panels(view: View, s: Snapshot): Panel[] {
+  const { period, lead, blockTimeMs } = view
   // Blocks keep coming between refreshes; extrapolate so the countdown moves every second
-  const elapsedBlocks = Math.floor((Date.now() - s.at) / blockTimeMs)
-  const head = s.head + elapsedBlocks
+  const head = s.head + Math.floor((Date.now() - s.at) / blockTimeMs)
   const boundary = nextBoundary(head, period)
   const windowStart = boundary - lead
   const progress = ((head + 1) % period) / period
 
-  lines.push(`${label('Block')}${blocks(head)}   ${c.dim('epoch')} ${s.epoch}${s.inDelayPeriod ? c.yellow('  (delay period)') : ''}   ${c.dim(`${blockTimeMs.toFixed(0)} ms/block`)}`)
+  const epoch: Row[] = [
+    [ 'block', blocks(head) ],
+    [ 'epoch', `${s.epoch}${s.inDelayPeriod ? c.yellow(' delay period') : ''}` ],
+    [ 'progress', `${bar(progress, 16)} ${Math.floor(progress * 100)}%` ],
+    [ 'boundary', `in ${duration((boundary - head) * blockTimeMs)}` ],
+    [ 'pace', `${blockTimeMs.toFixed(0)} ${c.dim('ms/block')}` ],
+  ]
+
   // A plan made for an earlier window is stale until the next refresh
   const plan = view.plan?.window === windowStart ? view.plan : null
   const next = plan && !plan.due ? plan.next : windowStart
-  if (head < next) {
-    lines.push(`${label('Next')}compound at ${blocks(next)} ${c.dim(`(boundary ${blocks(next + lead)})`)}  in ${c.bold(duration((next - head) * blockTimeMs))}`)
-  } else {
-    lines.push(`${label('Next')}${c.green('window open')}, boundary ${blocks(boundary)} in ${blocks(boundary - head)} blocks`)
+  const every = compoundEvery()
+  const auto = every === 'auto' ? c.dim(' auto') : ''
+  const compound: Row[] = [
+    [ 'next', head < next ? `in ${c.bold(duration((next - head) * blockTimeMs))}` : c.green('window open') ],
+    [ 'at', blocks(next) ],
+    [ 'interval', plan?.every ? `every ${epochs(plan.every)}${auto}` : every === 'auto' ? 'auto' : `every ${epochs(every)}` ],
+  ]
+  const stats = plan?.stats
+  if (stats) {
+    compound.push([ 'last', stats.epochsSince === 0 ? 'this epoch' : `${stats.estimated ? '~' : ''}${epochs(stats.epochsSince)} ago` ])
+    compound.push([ 'accrues', `${stats.perEpoch.toLocaleString('en-US', { maximumFractionDigits: 2 })} ${c.dim('MON/epoch')}` ])
+    if (stats.stakeYield !== undefined) compound.push([ 'yield', `${(stats.stakeYield * 100).toPrecision(3)}%${c.dim('/epoch')}` ])
+    if (stats.cost !== undefined) compound.push([ 'tx cost', `${stats.cost.toFixed(4)} ${c.dim('MON')}` ])
+  } else if (plan && plan.every !== 1) {
+    compound.push([ 'plan', plan.note ])
+  } else if (!plan && every !== 1) {
+    compound.push([ 'plan', view.planError ? c.red('failed') : c.dim('estimating…') ])
   }
-  lines.push(`${label('')}${bar(progress, Math.min(40, width - 22))} ${c.dim(`${Math.floor(progress * 100)}% of epoch`)}`)
-  lines.push('')
 
   const d = s.delegate
-  const ownerColor = s.ownerBalance < ethers.parseEther('11') ? c.yellow : (x: string) => x
-  let delegation: string
-  if (!d) delegation = c.red('not delegated')
-  else if (d.validatorId === null) delegation = c.yellow(`→ ${short(d.address)} (older build, run authorize)`)
-  else delegation = c.green(`→ ${short(d.address)}`)
-  lines.push(`${label('Owner')}${short(view.owner)}   ${ownerColor(formatMon(s.ownerBalance))}   ${delegation}`)
+  const owner: Row[] = [
+    [ 'address', short(view.owner) ],
+    [ 'balance', s.ownerBalance < OWNER_MIN_BALANCE ? c.yellow(mon(s.ownerBalance)) : mon(s.ownerBalance) ],
+  ]
+  if (d?.ownerKeeps != null) owner.push([ 'keeps', mon(d.ownerKeeps) ])
+  owner.push([ 'stake', mon(s.delegator.stake) ])
+  if (s.delegator.pendingStake > 0n) owner.push([ 'activating', c.cyan(`+${mon(s.delegator.pendingStake)}`) ])
+  owner.push([ 'rewards', mon(s.delegator.rewards) ])
+  owner.push([ 'delegate', !d ? c.red('none') : d.validatorId === null ? c.yellow(`${short(d.address)} older build`) : c.green(`→ ${short(d.address)}`) ])
 
-  const pending = s.delegator.pendingStake > 0n ? `   ${c.cyan(`+${formatMon(s.delegator.pendingStake)}`)} ${c.dim('activating')}` : ''
-  lines.push(`${label('Stake')}${formatMon(s.delegator.stake)} ${c.dim(`on validator ${s.validatorId}`)}${pending}`)
-  lines.push(`${label('Rewards')}${formatMon(s.delegator.rewards)} ${c.dim('pending compound')}`)
-
+  const result = [ { title: 'epoch', rows: epoch }, { title: 'compound', rows: compound }, { title: 'owner', rows: owner } ]
   if (d && s.keeperBalance !== null) {
     const low = d.keeperTarget !== null && s.keeperBalance + ethers.parseEther('0.5') < d.keeperTarget
-    let topUp = ''
-    if (d.lastTopUp) {
-      const ago = s.head - Number(d.lastTopUp)
-      topUp = c.dim(`   last top-up ${blocks(ago)} blocks ago (~${duration(ago * blockTimeMs)})`)
-    }
-    lines.push(`${label('Keeper')}${short(d.keeper)}   ${(low ? c.yellow : (x: string) => x)(formatMon(s.keeperBalance))}${topUp}`)
+    const keeper: Row[] = [ [ 'address', short(d.keeper) ], [ 'balance', low ? c.yellow(mon(s.keeperBalance)) : mon(s.keeperBalance) ] ]
+    if (d.keeperTarget !== null) keeper.push([ 'target', mon(d.keeperTarget) ])
+    if (d.lastTopUp !== null) keeper.push([ 'top-up', d.lastTopUp ? `${duration((s.head - Number(d.lastTopUp)) * blockTimeMs)} ago` : c.dim('never') ])
+    result.push({ title: 'keeper', rows: keeper })
   }
-  if (d?.ownerKeeps != null && d.keeperTarget != null) {
-    lines.push(`${label('Policy')}${c.dim(`owner keeps ${formatMon(d.ownerKeeps)}, the rest is staked; keeper refilled to ${formatMon(d.keeperTarget)}`)}`)
-  }
-  const every = compoundEvery()
-  const interval = plan?.every ? `every ${plan.every} epoch${plan.every === 1 ? '' : 's'}${every === 'auto' ? ' (auto)' : ''}` : every === 'auto' ? 'auto' : `every ${every} epochs`
-  lines.push(`${label('Interval')}${interval}`)
-  if (every !== 1) lines.push(`${label('')}${plan ? c.dim(plan.note) : view.planError ? c.red(view.planError) : c.dim('estimating...')}`)
-  if (view.error) lines.push(c.red(`RPC error: ${view.error} (showing data from ${duration(Date.now() - s.at)} ago)`))
+  return result
+}
 
-  lines.push('')
-  const logRows = Math.max(3, height - lines.length - 2)
-  lines.push(`${c.dim('Log ')}${c.dim('─'.repeat(Math.max(0, width - 4)))}`)
-  const journal = readJournal(logRows)
-  if (typeof journal === 'string') {
-    lines.push(c.dim(journal))
-  } else if (journal.length === 0) {
-    // Without access journalctl just shows nothing instead of failing
-    const privileged = process.getuid?.() === 0 || /\bsystemd-journal\b|\badm\b/.test(spawnSync('id', [ '-Gn' ], { encoding: 'utf-8' }).stdout ?? '')
-    lines.push(c.dim(privileged ? 'No log entries yet' : `Log hidden: run as root or add this user to systemd-journal`))
-  } else {
-    for (const [ time, message ] of journal) {
-      const color = /error/i.test(message) ? c.red : /warning|skip/i.test(message) ? c.yellow : /Confirmed|Compound /.test(message) ? c.green : (x: string) => x
-      lines.push(`${c.dim(time)}  ${color(message)}`)
+/** One line: everything fine, or what needs attention */
+function status(view: View, service: Service | null): string {
+  const s = view.snapshot
+  const crit: string[] = []
+  const warn: string[] = []
+  if (view.error) crit.push(`RPC: ${view.error}${s ? ` (data from ${duration(Date.now() - s.at)} ago)` : ''}`)
+  if (service && service.active !== 'active') {
+    (service.active === 'activating' ? warn : crit).push(`service ${service.active}${service.sub && service.sub !== service.active ? ` (${service.sub})` : ''}`)
+  }
+  const d = s?.delegate
+  if (s && !d) crit.push('owner is not delegated, run authorize')
+  if (d && d.validatorId === null) warn.push('older delegate build, run authorize')
+  if (s && d && s.keeperBalance !== null && d.keeperTarget !== null && s.keeperBalance + ethers.parseEther('0.5') < d.keeperTarget) warn.push('keeper balance low')
+  if (s && s.ownerBalance < OWNER_MIN_BALANCE) warn.push(`owner balance below ${Number(ethers.formatEther(OWNER_MIN_BALANCE))} MON`)
+  if (view.planError) warn.push(`plan: ${view.planError}`)
+  const problems = [ ...crit, ...warn ].join(c.dim(' · '))
+  if (crit.length) return `${c.red('● CRITICAL')}  ${problems}`
+  if (warn.length) return `${c.yellow('▲ WARNING')}  ${problems}`
+  return s ? c.green('● OK') : c.dim('● loading…')
+}
+
+function render(view: View): string[] {
+  const s = view.snapshot
+  const width = process.stdout.columns || 80
+  const height = process.stdout.rows || 30
+  const now = new Date()
+  const service = readService()
+
+  const about = [ `chain ${view.chainId}`, view.rpc ]
+  if (s) about.push(`validator ${s.validatorId}`)
+  if (service) {
+    const up = service.since && !isNaN(service.since.getTime()) ? ` ${duration(now.getTime() - service.since.getTime())}` : ''
+    about.push(`service ${service.active}${up}`)
+  }
+  const lines = [ `${c.cyan('monad-keeper')}  ${c.dim(clock(now))}  ${c.dim(about.join(' · '))}`, '' ]
+  if (s) lines.push(...layout(panels(view, s), width), '')
+  lines.push(status(view, service), '')
+
+  // The log takes the rest of the screen, the footer the last row
+  const logRows = height - lines.length - 3
+  if (logRows > 0) {
+    lines.push(c.dim('Recent log'))
+    const journal = readJournal()
+    if (typeof journal === 'string') {
+      lines.push(c.dim(journal))
+    } else if (journal.length === 0) {
+      // Without access journalctl just shows nothing instead of failing
+      const privileged = process.getuid?.() === 0 || /\bsystemd-journal\b|\badm\b/.test(spawnSync('id', [ '-Gn' ], { encoding: 'utf-8' }).stdout ?? '')
+      lines.push(c.dim(privileged ? 'No log entries yet' : 'Log hidden: run as root or add this user to systemd-journal'))
+    } else {
+      for (const [ time, message ] of journal.slice(-logRows)) {
+        const text = /^(Skip|Plan)/.test(message) ? c.dim(message) : message
+        lines.push(`${c.dim(time)} ${logIcon(message)} ${text}`)
+      }
     }
   }
-  lines.push(...Array(Math.max(0, height - lines.length - 1)).fill(''))
-  lines.push(c.dim('q quit · r refresh'))
-  return lines.slice(0, height).map(line => fit(line, width))
+  const body = lines.slice(0, height - 1)
+  body.push(...Array(Math.max(0, height - 1 - body.length)).fill(''), c.dim('q quit  r refresh'))
+  return body.map(line => fit(line, width))
 }
 
 /** Moves every thread of this process onto the service's cores, off the node's caches and interrupts */

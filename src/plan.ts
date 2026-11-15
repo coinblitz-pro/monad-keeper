@@ -33,6 +33,20 @@ export interface PlanInput {
   period: number
 }
 
+export interface PlanStats {
+  /** Rewards plus the owner's liquid balance above what it keeps */
+  accrued: bigint
+  epochsSince: number
+  /** The last compound is beyond the state history, epochsSince is estimated from perEpoch */
+  estimated: boolean
+  /** MON accrued per epoch */
+  perEpoch: number
+  /** Auto only: what one more staked MON earns the owner per epoch */
+  stakeYield?: number
+  /** Auto only: MON a compound tx costs */
+  cost?: number
+}
+
 export interface Plan {
   window: number
   /** Epochs between compounds, fixed or picked by auto; null when auto has nothing to go on */
@@ -42,6 +56,7 @@ export interface Plan {
   /** Window of the next compound */
   next: number
   note: string
+  stats: PlanStats | null
 }
 
 const totalStake = (d: DelegatorInfo) => d.stake + d.pendingStake
@@ -60,8 +75,8 @@ const totalStake = (d: DelegatorInfo) => d.stake + d.pendingStake
  */
 export async function planCompound(provider: ethers.Provider, p: PlanInput): Promise<Plan> {
   const setting = compoundEvery()
-  const plan = (every: number | null, due: boolean, note: string, wait = 1): Plan =>
-    ({ window: p.window, every, due, next: due ? p.window : p.window + Math.max(1, wait) * p.period, note })
+  const plan = (every: number | null, due: boolean, note: string, wait = 1, stats: PlanStats | null = null): Plan =>
+    ({ window: p.window, every, due, next: due ? p.window : p.window + Math.max(1, wait) * p.period, note, stats })
   if (setting === 1) return plan(1, true, 'every epoch')
 
   // Compounds land at windows, so sampling mid-epoch tells which window the last stake change was at
@@ -88,7 +103,7 @@ export async function planCompound(provider: ethers.Provider, p: PlanInput): Pro
     oldest = { block, delegator: past }
     newer = past
   }
-  if (since === 0) return plan(null, false, 'compounded or claimed this epoch, checking again at the next window')
+  if (since === 0) return plan(null, false, 'compounded or claimed this epoch')
 
   const accrued = now.rewards + (balance > p.ownerKeeps ? balance - p.ownerKeeps : 0n)
   const accruedMon = Number(ethers.formatEther(accrued))
@@ -109,10 +124,11 @@ export async function planCompound(provider: ethers.Provider, p: PlanInput): Pro
     return plan(null, true, 'RPC keeps no state history, compounding every epoch')
   }
   const beyond = since === null ? ' (the last compound is beyond state history)' : ''
+  const stats: PlanStats = { accrued, epochsSince, estimated: since === null, perEpoch: R }
 
   if (setting !== 'auto') {
     const note = `${since === null ? '~' : ''}${epochsSince} of ${epochs(setting)} since the last compound${beyond}`
-    return plan(setting, epochsSince >= setting, note, setting - epochsSince)
+    return plan(setting, epochsSince >= setting, note, setting - epochsSince, stats)
   }
 
   const account = new ethers.Contract(p.owner, DELEGATE_ABI, provider)
@@ -132,12 +148,14 @@ export async function planCompound(provider: ethers.Provider, p: PlanInput): Pro
   const y = validatorNow.authAddress === p.owner && commission < 1 ? netYield / (1 - commission) : netYield
   const cost = Number(ethers.formatEther((gas + COMPOUND_GAS_MARGIN) * (fee.gasPrice ?? fee.maxFeePerGas ?? 0n)))
 
-  const stats = `${formatMon(accrued)} accrued in ${since === null ? '~' : ''}${epochs(epochsSince)}${beyond} (~${R.toLocaleString('en-US', { maximumFractionDigits: 4 })} MON/epoch), ` +
+  const summary = `${formatMon(accrued)} accrued in ${since === null ? '~' : ''}${epochs(epochsSince)}${beyond} (~${R.toLocaleString('en-US', { maximumFractionDigits: 4 })} MON/epoch), ` +
     `stake earns ${(y * 100).toPrecision(3)}%/epoch, compound costs ${cost.toFixed(4)} MON`
-  if (!(y > 0) || !(R > 0)) return plan(null, false, `${stats}, nothing to gain, waiting`)
+  stats.stakeYield = y
+  stats.cost = cost
+  if (!(y > 0) || !(R > 0)) return plan(null, false, `${summary}, nothing to gain, waiting`, 1, stats)
 
   const lossPerEpoch = (n: number) => cost / n + y * R * (n - 1) / 2
   const floor = Math.max(1, Math.floor(Math.sqrt(2 * cost / (y * R))))
   const every = lossPerEpoch(floor) <= lossPerEpoch(floor + 1) ? floor : floor + 1
-  return plan(every, epochsSince >= every, `${stats} → every ${epochs(every)}`, every - epochsSince)
+  return plan(every, epochsSince >= every, `${summary} → every ${epochs(every)}`, every - epochsSince, stats)
 }
